@@ -1,133 +1,76 @@
-name: CI/CD – User Service
+name: Frontend-Workflow
 
 on:
   push:
-    branches: [main]
-    paths:
-      - 'user-service/**'
-  pull_request:
-    branches: [main]
-    paths:
-      - 'user-service/**'
+    branches:
+      - main
 
-env:
-  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/shopease-user-service
+# env:
+#   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+#   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+#   AWS_REGION: ${{ secrets.AWS_REGION }}
+#   AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION }}
+#   ECR_REPOSITORY: audio-frontend
+#   CLUSTER_NAME: audio-cluster
+#   SERVICE_NAME: audio-frontend-service
 
 jobs:
-  # ─── Job 1: Lint & Test ───────────────────────────────────────────────────
-  test:
+  build_and_test:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: user-service
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
         with:
-          node-version: '20'
-          cache: 'npm'
-          cache-dependency-path: user-service/package-lock.json
+          ref: ${{ github.ref_name }}
 
-      - name: Install dependencies
+      - name: setup node js enviroment
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22.21.0"
+
+      - name: Install Dependancies
         run: npm ci
 
-      - name: Run tests
+      - name: Build application
+        run: npm run build
+
+      - name: Test application
         run: npm test
-        env:
-          NODE_ENV: test
-          JWT_SECRET: test_secret_key_only
-          MONGODB_URI: mongodb://localhost:27017/test
 
-  # ─── Job 2: Security Scan (SAST – Snyk) ──────────────────────────────────
-  security:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: user-service
-    steps:
-      - uses: actions/checkout@v4
-      - name: Run Snyk to check for vulnerabilities
-        uses: snyk/actions/node@master
-        continue-on-error: true        # Non-blocking; report only
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        with:
-          args: --severity-threshold=high
+  # docker_image_build_and_push:
+  #   runs-on: ubuntu-latest
+  #   needs: build_and_test
 
-  # ─── Job 3: Build & Push Docker image ────────────────────────────────────
-  build-push:
-    needs: test
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
+  #       with:
+  #         ref: ${{ github.ref_name }}
 
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+  #     - name: Configure AWS Credentials
+  #       uses: aws-actions/configure-aws-credentials@v5.1.1
+  #       with:
+  #         aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
+  #         aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
+  #         aws-region: ${{ env.AWS_REGION }}
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+  #     - name: Login to Amazon ECR
+  #       id: login-ecr
+  #       uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+  #     - name: Build, tag, and push docker image to Amazon ECR
+  #       env:
+  #         REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+  #         REPOSITORY: ${{ env.ECR_REPOSITORY }}
+  #         IMAGE_TAG: latest
+  #       run: |
+  #         docker build -t $REGISTRY/$REPOSITORY:$IMAGE_TAG .
+  #         docker push $REGISTRY/$REPOSITORY:$IMAGE_TAG
 
-      - name: Extract metadata for Docker
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=latest
-            type=sha,prefix=sha-
-
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v5
-        with:
-          context: ./user-service
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  # ─── Job 4: Deploy to AWS ECS ─────────────────────────────────────────────
-  deploy:
-    needs: build-push
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-
-    steps:
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
-
-      - name: Download ECS task definition
-        run: |
-          aws ecs describe-task-definition \
-            --task-definition shopease-user-service \
-            --query taskDefinition > task-definition.json
-
-      - name: Update ECS task definition with new image
-        id: task-def
-        uses: aws-actions/amazon-ecs-render-task-definition@v1
-        with:
-          task-definition: task-definition.json
-          container-name: user-service
-          image: ${{ env.IMAGE_NAME }}:latest
-
-      - name: Deploy to ECS service
-        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
-        with:
-          task-definition: ${{ steps.task-def.outputs.task-definition }}
-          service: shopease-user-service
-          cluster: shopease-cluster
-          wait-for-service-stability: true
+  #     - name: Force new ECS deployment (Backend)
+  #       run: |
+  #         aws ecs update-service \
+  #           --cluster ${{ env.CLUSTER_NAME }} \
+  #           --service ${{ env.SERVICE_NAME }} \
+  #           --force-new-deployment
