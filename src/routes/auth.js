@@ -1,10 +1,12 @@
 const express = require('express');
 const jwt = require('jsonwebtoken');
+const axios = require('axios');
 const { body, validationResult } = require('express-validator');
 const User = require('../models/User');
 const { authenticate } = require('../middleware/auth');
 
 const router = express.Router();
+const NOTIFICATION_SERVICE_URL = process.env.NOTIFICATION_SERVICE_URL || 'http://localhost:3004';
 
 /**
  * @swagger
@@ -58,6 +60,12 @@ router.post(
       }
 
       const user = await User.create({ name, email, password });
+
+      // Fire-and-forget Welcome Email
+      axios.post(`${NOTIFICATION_SERVICE_URL}/api/notifications/welcome`, {
+        email: user.email,
+        name: user.name
+      }).catch(err => console.error("Welcome notification failed:", err.message));
 
       const token = jwt.sign(
         { userId: user._id, email: user.email, role: user.role },
