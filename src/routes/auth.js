@@ -3,7 +3,7 @@ const jwt = require('jsonwebtoken');
 const axios = require('axios');
 const { body, validationResult } = require('express-validator');
 const User = require('../models/User');
-const { authenticate } = require('../middleware/auth');
+const { authenticate, requireAdmin } = require('../middleware/auth');
 
 const router = express.Router();
 const NOTIFICATION_SERVICE_URL = process.env.NOTIFICATION_SERVICE_URL || 'http://localhost:3004';
@@ -232,5 +232,28 @@ router.put(
     }
   }
 );
+
+/**
+ * @swagger
+ * /auth/users:
+ *   get:
+ *     summary: Get all registered users (Admin only)
+ *     tags: [Auth]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: List of all users
+ *       403:
+ *         description: Admin access required
+ */
+router.get('/users', authenticate, requireAdmin, async (req, res) => {
+  try {
+    const users = await User.find({}).select('-password').sort({ createdAt: -1 });
+    res.json({ users });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch users' });
+  }
+});
 
 module.exports = router;
