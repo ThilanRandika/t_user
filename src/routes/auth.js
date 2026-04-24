@@ -7,6 +7,9 @@ const { authenticate, requireAdmin } = require('../middleware/auth');
 
 const router = express.Router();
 const NOTIFICATION_SERVICE_URL = process.env.NOTIFICATION_SERVICE_URL || 'http://localhost:3004';
+const ORDER_SERVICE_URL = process.env.ORDER_SERVICE_URL || 'http://localhost:3003';
+const PRODUCT_SERVICE_URL = process.env.PRODUCT_SERVICE_URL || 'http://localhost:3002';
+
 
 /**
  * @swagger
@@ -140,6 +143,11 @@ router.post(
         { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
       );
 
+      // Add this Fire-and-forget Login Alert
+      axios.post(`${NOTIFICATION_SERVICE_URL}/api/notifications/login-alert`, {
+        email: user.email
+      }).catch(err => console.error("Login notification failed:", err.message));
+
       res.json({
         message: 'Login successful',
         token,
@@ -226,6 +234,10 @@ router.put(
       if (req.body.name) updates.name = req.body.name;
 
       const user = await User.findByIdAndUpdate(req.user.userId, updates, { new: true, runValidators: true });
+      axios.post(`${NOTIFICATION_SERVICE_URL}/api/notifications/profile-update`, {
+        email: user.email,
+        name: user.name
+      }).catch(err => console.error("Profile update notification failed:", err.message));
       res.json({ message: 'Profile updated', user });
     } catch (err) {
       res.status(500).json({ error: 'Failed to update profile' });
@@ -255,5 +267,150 @@ router.get('/users', authenticate, requireAdmin, async (req, res) => {
     res.status(500).json({ error: 'Failed to fetch users' });
   }
 });
+
+/**
+ * @swagger
+ * /auth/profile/full:
+ *   get:
+ *     summary: Get aggregated user dashboard (Profile + Orders)
+ *     tags: [Auth]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Full user profile including order history
+ */
+router.get('/profile/full', authenticate, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    let orderHistory = [];
+    try {
+      // Make outbound call to the order service, passing along the user's JWT
+      const { data } = await axios.get(`${ORDER_SERVICE_URL}/orders`, {
+        headers: { Authorization: req.headers.authorization }, // Forward the Bearer token
+        timeout: 5000
+      });
+      orderHistory = data.orders || [];
+    } catch (orderErr) {
+      console.warn(`[Aggregator Warning] Could not fetch orders for user ${req.user.userId}: ${orderErr.message}`);
+      // Graceful degradation: If order service is down, still return profile but with an error note
+      orderHistory = { error: 'Temporarily unavailable' };
+    }
+
+    // Wishlist Hydration: Make outbound calls to product service
+    let hydratedWishlist = [];
+    if (user.wishlist && user.wishlist.length > 0) {
+      try {
+        const productPromises = user.wishlist.map(id => 
+          axios.get(`${PRODUCT_SERVICE_URL}/products/${id}`, { timeout: 3000 })
+            .then(pRes => pRes.data.product)
+            .catch(err => null) // Ignore 404s for deleted products
+        );
+        const resolvedProducts = await Promise.all(productPromises);
+        hydratedWishlist = resolvedProducts.filter(p => p !== null);
+      } catch (err) {
+        console.warn(`[Hydration Warning] Could not hydrate wishlist for user ${req.user.userId}: ${err.message}`);
+      }
+    }
+
+    res.json({ 
+      user,
+      orders: orderHistory,
+      wishlist: hydratedWishlist
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch aggregated profile' });
+  }
+});
+
+
+/**
+ * @swagger
+ * /auth/users/{id}/deactivate:
+ *   put:
+ *     summary: Deactivate a user and anonymize their orders (Admin only)
+ *     tags: [Auth]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: User deactivated
+ */
+router.put('/users/:id/deactivate', authenticate, requireAdmin, async (req, res) => {
+  try {
+    const user = await User.findById(req.params.id);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    user.isActive = false;
+    await user.save();
+
+    // Fire-and-forget: Sync with Order Service to anonymize data
+    axios.put(`${ORDER_SERVICE_URL}/orders/user/${user._id}/anonymize`, {}, {
+      headers: { Authorization: req.headers.authorization }
+    }).catch(err => console.error("Order anonymization sync failed:", err.message));
+
+    res.json({ message: 'User deactivated successfully' });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to deactivate user' });
+  }
+});
+
+/**
+ * @swagger
+ * /auth/profile/wishlist:
+ *   put:
+ *     summary: Add or remove an item from the wishlist
+ *     tags: [Auth]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [productId, action]
+ *             properties:
+ *               productId:
+ *                 type: string
+ *               action:
+ *                 type: string
+ *                 enum: [add, remove]
+ *     responses:
+ *       200:
+ *         description: Wishlist updated
+ */
+router.put(
+  '/profile/wishlist',
+  authenticate,
+  [
+    body('productId').trim().notEmpty().withMessage('Product ID is required'),
+    body('action').isIn(['add', 'remove']).withMessage('Action must be add or remove'),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+    try {
+      const { productId, action } = req.body;
+      const update = action === 'add' 
+        ? { $addToSet: { wishlist: productId } }
+        : { $pull: { wishlist: productId } };
+
+      const user = await User.findByIdAndUpdate(req.user.userId, update, { new: true });
+      res.json({ message: 'Wishlist updated', wishlist: user.wishlist });
+    } catch (err) {
+      res.status(500).json({ error: 'Failed to update wishlist' });
+    }
+  }
+);
 
 module.exports = router;
